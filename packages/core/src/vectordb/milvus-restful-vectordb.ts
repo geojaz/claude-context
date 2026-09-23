@@ -822,6 +822,47 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
     }
 
     /**
+     * Get the dense vector dimension configured for a collection's `vector` field.
+     * Returns -1 if the dimension cannot be determined (collection missing, request
+     * failure, unrecognized response shape, etc). -1 means "unknown". Callers must
+     * NOT treat it as a dimension mismatch.
+     *
+     * The `params` shape for a described field is not exercised by any existing
+     * test in this file, so this parses defensively across the shapes the v2 REST
+     * API is known to use (an array of {key, value} pairs or a plain object) plus
+     * this file's own `elementTypeParams` naming used when creating collections.
+     */
+    async getCollectionDimension(collectionName: string): Promise<number> {
+        await this.ensureInitialized();
+        try {
+            const restfulConfig = this.config as MilvusRestfulConfig;
+            const response = await this.makeRequest('/collections/describe', 'POST', {
+                collectionName,
+                dbName: restfulConfig.database
+            });
+
+            const fields = response.data?.fields || [];
+            const vectorField = fields.find((f: any) => f.name === 'vector' || f.fieldName === 'vector');
+            if (!vectorField) return -1;
+
+            let dim: any;
+            if (Array.isArray(vectorField.params)) {
+                dim = vectorField.params.find((p: any) => p.key === 'dim')?.value;
+            } else if (vectorField.params && typeof vectorField.params === 'object') {
+                dim = vectorField.params.dim;
+            } else if (vectorField.elementTypeParams) {
+                dim = vectorField.elementTypeParams.dim;
+            }
+
+            const n = typeof dim === 'number' ? dim : parseInt(String(dim), 10);
+            return Number.isFinite(n) && n > 0 ? n : -1;
+        } catch (error) {
+            console.error(`[MilvusRestfulDB] ❌ Error describing collection '${collectionName}' for dimension check:`, error);
+            return -1;
+        }
+    }
+
+    /**
      * Check collection limit
      * Returns true if collection can be created, false if limit exceeded
      * TODO: Implement proper collection limit checking for REST API

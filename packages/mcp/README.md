@@ -717,6 +717,8 @@ Index a codebase directory for hybrid search (BM25 + dense vector).
 - `customExtensions` (optional): Additional file extensions to include beyond defaults (e.g., ['.vue', '.svelte', '.astro']). Extensions should include the dot prefix or will be automatically added (default: [])
 - `ignorePatterns` (optional): Additional ignore patterns to exclude specific files/directories beyond defaults (e.g., ['static/**', '*.tmp', 'private/**']) (default: [])
 
+Re-running `index_codebase` on a codebase whose previous run failed or was interrupted resumes it without `force`: only files that are missing or changed since the last run are re-indexed. Use `force: true` to clear the existing index and rebuild it from scratch (e.g., after changing the embedding model or splitter settings).
+
 ### 2. `search_code`
 
 Search the indexed codebase using natural language queries with hybrid search (BM25 + dense vector).

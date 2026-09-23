@@ -145,6 +145,14 @@ export interface VectorDatabase {
      * Callers should treat -1 as "unknown" and NOT as "empty".
      */
     getCollectionRowCount(collectionName: string): Promise<number>;
+
+    /**
+     * Get the dense vector dimension configured for a collection's `vector` field.
+     * Returns -1 if the dimension cannot be determined (collection missing, request
+     * failure, unrecognized schema shape, etc). Callers should treat -1 as "unknown"
+     * and NOT as a dimension mismatch.
+     */
+    getCollectionDimension(collectionName: string): Promise<number>;
 }
 
 /**

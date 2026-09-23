@@ -329,6 +329,17 @@ export class ToolHandlers {
         const customIgnorePatterns = ignorePatterns || [];
 
         try {
+            // Capture whether this codebase was already confirmed fully indexed
+            // BEFORE any cloud-recovery heuristics run below. syncIndexedCodebasesFromCloud
+            // (and the snapshot/cloud sync check further down) can optimistically promote
+            // an interrupted/unknown-completeness collection to "indexed" purely from a
+            // nonzero Milvus row count (see Issue #295 area). Gating the "already indexed"
+            // check on that possibly-recovered status would incorrectly block a resume with
+            // "already indexed, use force=true" for a codebase that was never actually
+            // confirmed complete (failed/interrupted status, or no snapshot entry at all).
+            const preRecoveryAbsolutePath = ensureAbsolutePath(codebasePath);
+            const wasAlreadyIndexedBeforeThisRequest = this.snapshotManager.getCodebaseStatus(preRecoveryAbsolutePath) === 'indexed';
+
             // Sync indexed codebases from cloud first
             await this.syncIndexedCodebasesFromCloud();
 
@@ -414,8 +425,13 @@ export class ToolHandlers {
                 }
             }
 
-            // Check if already indexed (unless force is true)
-            if (!forceReindex && this.snapshotManager.getIndexedCodebases().includes(absolutePath)) {
+            // Check if already indexed (unless force is true). Gate on the
+            // pre-recovery status captured above, not the possibly-optimistic
+            // status after cloud recovery: a codebase that wasn't confirmed
+            // indexed before this request started falls through to
+            // indexCodebase, which now resumes an interrupted/partial index
+            // instead of requiring a full force re-index.
+            if (!forceReindex && wasAlreadyIndexedBeforeThisRequest) {
                 return {
                     content: [{
                         type: "text",

@@ -752,6 +752,31 @@ export class MilvusVectorDatabase implements VectorDatabase {
     }
 
     /**
+     * Get the dense vector dimension configured for a collection's `vector` field.
+     * Returns -1 if the dimension cannot be determined (collection missing,
+     * describeCollection failure, no vector field found, etc). -1 means
+     * "unknown". Callers must NOT treat it as a dimension mismatch.
+     */
+    async getCollectionDimension(collectionName: string): Promise<number> {
+        await this.ensureInitialized();
+        if (!this.client) return -1;
+        try {
+            const result = await this.client.describeCollection({
+                collection_name: collectionName,
+            });
+            const fields = (result as any).schema?.fields || [];
+            const vectorField = fields.find((f: any) => f.name === 'vector');
+            if (!vectorField) return -1;
+            const dim = vectorField.dim;
+            const n = typeof dim === 'number' ? dim : parseInt(String(dim), 10);
+            return Number.isFinite(n) && n > 0 ? n : -1;
+        } catch (error) {
+            console.error(`[MilvusDB] Error describing collection '${collectionName}' for dimension check:`, error);
+            return -1;
+        }
+    }
+
+    /**
      * Wrapper method to handle collection creation with limit detection for gRPC client
      * Returns true if collection can be created, false if limit exceeded
      */

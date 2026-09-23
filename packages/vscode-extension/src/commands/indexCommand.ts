@@ -43,14 +43,34 @@ export class IndexCommand {
             selectedFolder = selected.folder;
         }
 
-        const confirm = await vscode.window.showInformationMessage(
-            `Index codebase at: ${selectedFolder.uri.fsPath}?\n\nThis will create embeddings for all supported code files.`,
-            'Yes',
-            'Cancel'
-        );
+        const hasIndex = await this.context.hasIndex(selectedFolder.uri.fsPath);
+        let shouldClearFirst = true;
 
-        if (confirm !== 'Yes') {
-            return;
+        if (hasIndex) {
+            const RESUME_OPTION = 'Resume';
+            const REBUILD_OPTION = 'Rebuild';
+            const choice = await vscode.window.showInformationMessage(
+                `An index already exists for ${selectedFolder.uri.fsPath}. Resume indexes only files that are missing or changed. Rebuild clears the index and starts over (choose Rebuild after changing the embedding model or splitter settings).`,
+                { modal: true },
+                RESUME_OPTION,
+                REBUILD_OPTION
+            );
+
+            if (choice !== RESUME_OPTION && choice !== REBUILD_OPTION) {
+                return;
+            }
+
+            shouldClearFirst = choice === REBUILD_OPTION;
+        } else {
+            const confirm = await vscode.window.showInformationMessage(
+                `Index codebase at: ${selectedFolder.uri.fsPath}?\n\nThis will create embeddings for all supported code files.`,
+                'Yes',
+                'Cancel'
+            );
+
+            if (confirm !== 'Yes') {
+                return;
+            }
         }
 
         try {
@@ -63,14 +83,16 @@ export class IndexCommand {
             }, async (progress) => {
                 let lastPercentage = 0;
 
-                // Clear existing index first
-                await this.context.clearIndex(
-                    selectedFolder.uri.fsPath,
-                    (progressInfo) => {
-                        // Clear index progress is usually fast, just show the message
-                        progress.report({ increment: 0, message: progressInfo.phase });
-                    }
-                );
+                if (shouldClearFirst) {
+                    // Clear existing index first
+                    await this.context.clearIndex(
+                        selectedFolder.uri.fsPath,
+                        (progressInfo) => {
+                            // Clear index progress is usually fast, just show the message
+                            progress.report({ increment: 0, message: progressInfo.phase });
+                        }
+                    );
+                }
 
                 // Initialize file synchronizer
                 progress.report({ increment: 0, message: 'Initializing file synchronizer...' });

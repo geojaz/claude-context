@@ -130,6 +130,12 @@ export interface ContextConfig {
 
 export class Context {
     private static readonly MAX_COLLECTION_NAME_LENGTH = 255;
+    // Milvus caps a single query at offset + limit <= 16384. queryFileChunkIds
+    // never sets an offset, and both vector database implementations only
+    // default the limit when no filter is given, so a filtered query like this
+    // one falls back to Milvus's own default of 100 rows unless we ask for
+    // more explicitly. 16384 is the most we can request in one call.
+    private static readonly MAX_CHUNK_ID_QUERY_LIMIT = 16384;
 
     private embedding: Embedding;
     private vectorDatabase: VectorDatabase;
@@ -269,7 +275,7 @@ export class Context {
      * Public wrapper for prepareCollection private method
      */
     async getPreparedCollection(codebasePath: string): Promise<void> {
-        return this.prepareCollection(codebasePath);
+        await this.prepareCollection(codebasePath);
     }
 
     /**
@@ -373,7 +379,7 @@ export class Context {
         // 2. Check and prepare vector collection
         progressCallback?.({ phase: 'Preparing collection...', current: 0, total: 100, percentage: 0 });
         console.log(`Debug2: Preparing vector collection for codebase${forceReindex ? ' (FORCE REINDEX)' : ''}`);
-        await this.prepareCollection(codebasePath, forceReindex);
+        const isResume = await this.prepareCollection(codebasePath, forceReindex);
 
         // 3. Recursively traverse codebase to get all supported files
         progressCallback?.({ phase: 'Scanning files...', current: 5, total: 100, percentage: 5 });
@@ -408,10 +414,16 @@ export class Context {
                 });
             },
             splitter,
-            signal
+            signal,
+            isResume
         );
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
+
+        if (isResume && result.resumeStats) {
+            const { skipped, reindexed, newlyIndexed } = result.resumeStats;
+            console.log(`[Context] 🔁 Resume summary for ${codebasePath}: ${skipped} skipped, ${reindexed} re-indexed, ${newlyIndexed} newly indexed`);
+        }
 
         progressCallback?.({
             phase: 'Indexing complete!',
@@ -503,21 +515,31 @@ export class Context {
         return { added: added.length, removed: removed.length, modified: modified.length };
     }
 
-    private async deleteFileChunks(collectionName: string, relativePath: string): Promise<void> {
+    /**
+     * Query the chunk IDs currently stored for a given file. Shared by
+     * deleteFileChunks (incremental sync) and the resume path in
+     * processFileList, which needs the existing IDs to decide whether a
+     * file can be skipped, must be re-indexed, or is being indexed for the
+     * first time.
+     */
+    private async queryFileChunkIds(collectionName: string, relativePath: string): Promise<string[]> {
         // Escape backslashes for Milvus query expression (Windows path compatibility)
         const escapedPath = relativePath.replace(/\\/g, '\\\\');
         const results = await this.vectorDatabase.query(
             collectionName,
             `relativePath == "${escapedPath}"`,
-            ['id']
+            ['id'],
+            Context.MAX_CHUNK_ID_QUERY_LIMIT
         );
 
-        if (results.length > 0) {
-            const ids = results.map(r => r.id as string).filter(id => id);
-            if (ids.length > 0) {
-                await this.vectorDatabase.delete(collectionName, ids);
-                console.log(`[Context] Deleted ${ids.length} chunks for file ${relativePath}`);
-            }
+        return results.map(r => r.id as string).filter(id => id);
+    }
+
+    private async deleteFileChunks(collectionName: string, relativePath: string): Promise<void> {
+        const ids = await this.queryFileChunkIds(collectionName, relativePath);
+        if (ids.length > 0) {
+            await this.vectorDatabase.delete(collectionName, ids);
+            console.log(`[Context] Deleted ${ids.length} chunks for file ${relativePath}`);
         }
     }
 
@@ -768,8 +790,12 @@ export class Context {
 
     /**
      * Prepare vector collection
+     * @returns true if an existing collection is being reused (resume mode),
+     *          false if a fresh collection was just created (fresh index or
+     *          force re-index). Fresh/force paths issue no extra vector DB
+     *          queries beyond the existing hasCollection check.
      */
-    private async prepareCollection(codebasePath: string, forceReindex: boolean = false): Promise<void> {
+    private async prepareCollection(codebasePath: string, forceReindex: boolean = false): Promise<boolean> {
         const isHybrid = this.getIsHybrid();
         const collectionType = isHybrid === true ? 'hybrid vector' : 'vector';
         console.log(`[Context] 🔧 Preparing ${collectionType} collection for codebase: ${codebasePath}${forceReindex ? ' (FORCE REINDEX)' : ''}`);
@@ -780,7 +806,8 @@ export class Context {
 
         if (collectionExists && !forceReindex) {
             console.log(`📋 Collection ${collectionName} already exists, skipping creation`);
-            return;
+            await this.checkResumeDimensionCompatibility(collectionName, codebasePath);
+            return true;
         }
 
         if (collectionExists && forceReindex) {
@@ -801,6 +828,27 @@ export class Context {
         }
 
         console.log(`[Context] ✅ Collection ${collectionName} created successfully (dimension: ${dimension})`);
+        return false;
+    }
+
+    /**
+     * Resume-mode-only guard: compare the resumed collection's dense vector
+     * dimension against the current embedding model's dimension. Skips
+     * silently when the existing dimension can't be determined (-1) rather
+     * than blocking a legitimate resume on an inconclusive read.
+     */
+    private async checkResumeDimensionCompatibility(collectionName: string, codebasePath: string): Promise<void> {
+        const existingDimension = await this.vectorDatabase.getCollectionDimension(collectionName);
+        if (existingDimension <= 0) {
+            return;
+        }
+
+        const currentDimension = await this.embedding.detectDimension();
+        if (existingDimension !== currentDimension) {
+            throw new Error(
+                `Existing index for ${codebasePath} uses ${existingDimension}-dimension vectors but the current embedding model produces ${currentDimension}; rebuild the index (force re-index) to switch models.`
+            );
+        }
     }
 
     /**
@@ -853,17 +901,23 @@ export class Context {
         codebasePath: string,
         onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void,
         splitter: Splitter = this.codeSplitter,
-        signal?: AbortSignal
-    ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
+        signal?: AbortSignal,
+        isResume: boolean = false
+    ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached'; resumeStats?: { skipped: number; reindexed: number; newlyIndexed: number } }> {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
         const CHUNK_LIMIT = 450000;
         console.log(`[Context] 🔧 Using EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE}`);
 
+        const collectionName = this.getCollectionName(codebasePath);
+
         let chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }> = [];
         let processedFiles = 0;
         let totalChunks = 0;
         let limitReached = false;
+        let resumeSkipped = 0;
+        let resumeReindexed = 0;
+        let resumeNewlyIndexed = 0;
 
         for (let i = 0; i < filePaths.length; i++) {
             // Cooperative cancellation: bail out at the next file boundary so the
@@ -879,6 +933,34 @@ export class Context {
                 const content = await fs.promises.readFile(filePath, 'utf-8');
                 const language = this.getLanguageFromExtension(path.extname(filePath));
                 const chunks = await splitter.split(content, language, filePath);
+
+                if (isResume) {
+                    const relativePath = path.relative(codebasePath, filePath);
+                    const newIds = chunks.map(chunk =>
+                        this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content)
+                    );
+                    const existingIds = new Set(await this.queryFileChunkIds(collectionName, relativePath));
+
+                    if (existingIds.size > 0 && existingIds.size === newIds.length && newIds.every(id => existingIds.has(id))) {
+                        // Already fully indexed by a previous run and unchanged: skip
+                        // entirely (no embedding, no insert) but still count it toward
+                        // progress.
+                        resumeSkipped++;
+                        processedFiles++;
+                        onFileProcessed?.(filePath, i + 1, filePaths.length);
+                        continue;
+                    }
+
+                    if (existingIds.size > 0) {
+                        // Partially indexed by an interrupted run, or the file/splitter
+                        // settings changed since the last run: drop the stale chunks
+                        // before re-indexing from scratch below.
+                        await this.deleteFileChunks(collectionName, relativePath);
+                        resumeReindexed++;
+                    } else {
+                        resumeNewlyIndexed++;
+                    }
+                }
 
                 // Log files with many chunks or large content
                 if (chunks.length > 50) {
@@ -958,7 +1040,8 @@ export class Context {
         return {
             processedFiles,
             totalChunks,
-            status: limitReached ? 'limit_reached' : 'completed'
+            status: limitReached ? 'limit_reached' : 'completed',
+            ...(isResume ? { resumeStats: { skipped: resumeSkipped, reindexed: resumeReindexed, newlyIndexed: resumeNewlyIndexed } } : {})
         };
     }
 

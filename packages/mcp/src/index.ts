@@ -93,6 +93,7 @@ Index a codebase directory to enable semantic search using a configurable code s
 ✨ **Usage Guidance**:
 - This tool is typically used when search fails due to an unindexed codebase.
 - If indexing is attempted on an already indexed path, and a conflict is detected, you MUST prompt the user to confirm whether to proceed with a force index (i.e., re-indexing and overwriting the previous index).
+- If a previous indexing run failed or was interrupted, simply re-running this tool without force resumes it: only files that are missing or changed since the last run are re-indexed. Use force=true only when you need to fully rebuild the index (e.g., after changing the embedding model or splitter settings).
 `;
 
 

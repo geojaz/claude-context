@@ -113,6 +113,11 @@ MILVUS_TOKEN=your-zilliz-cloud-api-key
 - `Semantic Code Search: Index Codebase` - Index current codebase
 - `Semantic Code Search: Clear Index` - Clear the index
 
+If an index already exists for the selected folder, running "Index Codebase" again prompts you to choose:
+
+- **Resume** - indexes only files that are missing or changed since the last run.
+- **Rebuild** - clears the index and starts over. Choose this after changing the embedding model or splitter settings.
+
 ## Configuration
 
 - `semanticCodeSearch.embeddingProvider.provider` - Embedding provider (OpenAI/VoyageAI/Gemini/GeminiVertexAI/Ollama)

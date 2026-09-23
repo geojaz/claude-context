@@ -79,6 +79,7 @@ const createVectorDatabase = (): jest.Mocked<VectorDatabase> => ({
     getCollectionDescription: jest.fn().mockResolvedValue(''),
     checkCollectionLimit: jest.fn().mockResolvedValue(true),
     getCollectionRowCount: jest.fn().mockResolvedValue(0),
+    getCollectionDimension: jest.fn().mockResolvedValue(-1),
 });
 
 describe('Context embedding failure handling', () => {
