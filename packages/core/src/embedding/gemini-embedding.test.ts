@@ -160,4 +160,175 @@ describe('GeminiEmbedding', () => {
         const constructorArgs = (GoogleGenAI as unknown as jest.Mock).mock.calls[0][0];
         expect(constructorArgs.httpOptions).toEqual({ baseUrl: 'https://example.com/custom' });
     });
+
+    describe('retry behavior', () => {
+        it('retries embedBatch once on a 429 status error then succeeds', async () => {
+            const retryableError = Object.assign(new Error('Too Many Requests'), { status: 429 });
+            mockEmbedContent
+                .mockRejectedValueOnce(retryableError)
+                .mockResolvedValueOnce({
+                    embeddings: [
+                        { values: [1, 0, 0] },
+                        { values: [0, 1, 0] },
+                    ],
+                });
+
+            const embedding = new GeminiEmbedding({
+                apiKey: 'test-api-key',
+                model: 'gemini-embedding-001',
+                retryBaseDelayMs: 1,
+                retryMaxDelayMs: 2,
+            });
+
+            const embeddings = await embedding.embedBatch(['first chunk', 'second chunk']);
+
+            expect(embeddings).toEqual([
+                { vector: [1, 0, 0], dimension: 3 },
+                { vector: [0, 1, 0], dimension: 3 },
+            ]);
+            expect(mockEmbedContent).toHaveBeenCalledTimes(2);
+        });
+
+        it('rejects immediately on a 400 status error without retrying', async () => {
+            const nonRetryableError = Object.assign(new Error('Bad Request'), { status: 400 });
+            mockEmbedContent.mockRejectedValueOnce(nonRetryableError);
+
+            const embedding = new GeminiEmbedding({
+                apiKey: 'test-api-key',
+                model: 'gemini-embedding-001',
+                retryBaseDelayMs: 1,
+                retryMaxDelayMs: 2,
+            });
+
+            await expect(embedding.embedBatch(['first chunk', 'second chunk']))
+                .rejects
+                .toThrow('Gemini batch embedding failed: Bad Request');
+            expect(mockEmbedContent).toHaveBeenCalledTimes(1);
+        });
+
+        it('rejects after exhausting retries on a persistent 503 status error', async () => {
+            const retryableError = Object.assign(new Error('Service Unavailable'), { status: 503 });
+            mockEmbedContent.mockRejectedValue(retryableError);
+
+            const embedding = new GeminiEmbedding({
+                apiKey: 'test-api-key',
+                model: 'gemini-embedding-001',
+                maxRetries: 2,
+                retryBaseDelayMs: 1,
+                retryMaxDelayMs: 2,
+            });
+
+            await expect(embedding.embedBatch(['first chunk', 'second chunk']))
+                .rejects
+                .toThrow('3 attempts');
+            expect(mockEmbedContent).toHaveBeenCalledTimes(3);
+        });
+
+        it('retries embedBatch once on a network fetch failure then succeeds', async () => {
+            const networkError = Object.assign(new TypeError('fetch failed'), {
+                cause: { code: 'ECONNRESET' },
+            });
+            mockEmbedContent
+                .mockRejectedValueOnce(networkError)
+                .mockResolvedValueOnce({
+                    embeddings: [
+                        { values: [1, 0, 0] },
+                        { values: [0, 1, 0] },
+                    ],
+                });
+
+            const embedding = new GeminiEmbedding({
+                apiKey: 'test-api-key',
+                model: 'gemini-embedding-001',
+                retryBaseDelayMs: 1,
+                retryMaxDelayMs: 2,
+            });
+
+            const embeddings = await embedding.embedBatch(['first chunk', 'second chunk']);
+
+            expect(embeddings).toEqual([
+                { vector: [1, 0, 0], dimension: 3 },
+                { vector: [0, 1, 0], dimension: 3 },
+            ]);
+            expect(mockEmbedContent).toHaveBeenCalledTimes(2);
+        });
+
+        it('retries embedBatch once on a quoted RESOURCE_EXHAUSTED status in the message then succeeds', async () => {
+            const quotedStatusError = new Error('Request failed: {"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}}');
+            mockEmbedContent
+                .mockRejectedValueOnce(quotedStatusError)
+                .mockResolvedValueOnce({
+                    embeddings: [
+                        { values: [1, 0, 0] },
+                        { values: [0, 1, 0] },
+                    ],
+                });
+
+            const embedding = new GeminiEmbedding({
+                apiKey: 'test-api-key',
+                model: 'gemini-embedding-001',
+                retryBaseDelayMs: 1,
+                retryMaxDelayMs: 2,
+            });
+
+            const embeddings = await embedding.embedBatch(['first chunk', 'second chunk']);
+
+            expect(embeddings).toEqual([
+                { vector: [1, 0, 0], dimension: 3 },
+                { vector: [0, 1, 0], dimension: 3 },
+            ]);
+            expect(mockEmbedContent).toHaveBeenCalledTimes(2);
+        });
+
+        it('retries embed() once on a 429 status error then succeeds', async () => {
+            const retryableError = Object.assign(new Error('Too Many Requests'), { status: 429 });
+            mockEmbedContent
+                .mockRejectedValueOnce(retryableError)
+                .mockResolvedValueOnce({
+                    embeddings: [
+                        { values: [1, 0, 0] },
+                    ],
+                });
+
+            const embedding = new GeminiEmbedding({
+                apiKey: 'test-api-key',
+                model: 'gemini-embedding-001',
+                retryBaseDelayMs: 1,
+                retryMaxDelayMs: 2,
+            });
+
+            const result = await embedding.embed('a single chunk');
+
+            expect(result).toEqual({ vector: [1, 0, 0], dimension: 3 });
+            expect(mockEmbedContent).toHaveBeenCalledTimes(2);
+        });
+
+        it('uses GEMINI_MAX_RETRIES from the environment when maxRetries is not set in config', async () => {
+            const previousValue = process.env.GEMINI_MAX_RETRIES;
+            process.env.GEMINI_MAX_RETRIES = '1';
+
+            try {
+                const retryableError = Object.assign(new Error('Service Unavailable'), { status: 503 });
+                mockEmbedContent.mockRejectedValue(retryableError);
+
+                const embedding = new GeminiEmbedding({
+                    apiKey: 'test-api-key',
+                    model: 'gemini-embedding-001',
+                    retryBaseDelayMs: 1,
+                    retryMaxDelayMs: 2,
+                });
+
+                await expect(embedding.embedBatch(['first chunk', 'second chunk']))
+                    .rejects
+                    .toThrow('2 attempts');
+                expect(mockEmbedContent).toHaveBeenCalledTimes(2);
+            } finally {
+                if (previousValue === undefined) {
+                    delete process.env.GEMINI_MAX_RETRIES;
+                } else {
+                    process.env.GEMINI_MAX_RETRIES = previousValue;
+                }
+            }
+        });
+    });
 });

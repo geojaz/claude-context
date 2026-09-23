@@ -30,6 +30,8 @@ Claude Context supports a global configuration file at `~/.context/.env` to simp
 | `GOOGLE_GENAI_USE_VERTEXAI` | Call Gemini through Vertex AI using Application Default Credentials instead of an API key | `false` |
 | `GOOGLE_CLOUD_PROJECT` | Google Cloud project ID | Required when `GOOGLE_GENAI_USE_VERTEXAI=true` |
 | `GOOGLE_CLOUD_LOCATION` | Google Cloud region (e.g. `us-central1`) | Required when `GOOGLE_GENAI_USE_VERTEXAI=true` |
+| `GEMINI_MAX_RETRIES` | Retries for transient Gemini errors such as 429 or 503 | `8` |
+| `GEMINI_RETRY_BASE_DELAY_MS` | Initial backoff delay in ms, doubles per retry up to 32s | `1000` |
 
 > **💡 Note:** `EMBEDDING_MODEL` is a universal environment variable that works with all embedding providers. Simply set it to the model name you want to use (e.g., `text-embedding-3-large` for OpenAI, `voyage-code-3` for VoyageAI, etc.).
 
