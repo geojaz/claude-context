@@ -36,6 +36,10 @@ const RETRYABLE_NETWORK_CODES = new Set([
 ]);
 const RETRYABLE_QUOTED_STATUS_PATTERN = /"status"\s*:\s*"(RESOURCE_EXHAUSTED|UNAVAILABLE|DEADLINE_EXCEEDED)"/;
 
+const DEFAULT_MAX_RETRIES = 8;
+const DEFAULT_RETRY_BASE_DELAY_MS = 1000;
+const DEFAULT_RETRY_MAX_DELAY_MS = 32000;
+
 export class GeminiEmbedding extends Embedding {
     private client: GoogleGenAI;
     private config: GeminiEmbeddingConfig;
@@ -60,9 +64,27 @@ export class GeminiEmbedding extends Embedding {
             }),
         });
 
-        this.maxRetries = this.resolveRetryOption(config.maxRetries, 'GEMINI_MAX_RETRIES', 8);
-        this.retryBaseDelayMs = this.resolveRetryOption(config.retryBaseDelayMs, 'GEMINI_RETRY_BASE_DELAY_MS', 1000);
-        this.retryMaxDelayMs = config.retryMaxDelayMs !== undefined ? config.retryMaxDelayMs : 32000;
+        this.maxRetries = this.resolveRetrySetting(
+            'maxRetries',
+            config.maxRetries,
+            'GEMINI_MAX_RETRIES',
+            DEFAULT_MAX_RETRIES,
+            value => Number.isInteger(value) && value >= 0
+        );
+        this.retryBaseDelayMs = this.resolveRetrySetting(
+            'retryBaseDelayMs',
+            config.retryBaseDelayMs,
+            'GEMINI_RETRY_BASE_DELAY_MS',
+            DEFAULT_RETRY_BASE_DELAY_MS,
+            value => Number.isInteger(value) && value >= 1
+        );
+        this.retryMaxDelayMs = this.resolveRetrySetting(
+            'retryMaxDelayMs',
+            config.retryMaxDelayMs,
+            undefined,
+            Math.max(DEFAULT_RETRY_MAX_DELAY_MS, this.retryBaseDelayMs),
+            value => Number.isInteger(value) && value >= this.retryBaseDelayMs
+        );
 
         // Set dimension based on model and configuration
         this.updateDimensionForModel(config.model || 'gemini-embedding-001');
@@ -161,24 +183,46 @@ export class GeminiEmbedding extends Embedding {
         };
     }
 
-    private resolveRetryOption(configValue: number | undefined, envVarName: string, defaultValue: number): number {
+    /**
+     * Resolves a retry-related setting from, in order, the constructor
+     * config, an environment variable (when one applies), and finally the
+     * default. Config and env values share the same validation: an invalid
+     * value is never silently coerced, it's logged and replaced by the
+     * default so a typo can't disable retries or spin the loop forever.
+     */
+    private resolveRetrySetting(
+        settingName: string,
+        configValue: number | undefined,
+        envVarName: string | undefined,
+        defaultValue: number,
+        isValid: (value: number) => boolean
+    ): number {
         if (configValue !== undefined) {
-            return configValue;
+            if (isValid(configValue)) {
+                return configValue;
+            }
+            console.warn(`[GeminiEmbedding] ⚠️  Invalid ${settingName} (${configValue}); using default ${defaultValue}`);
+            return defaultValue;
         }
 
-        const envValue = envManager.get(envVarName);
+        const envValue = envVarName ? envManager.get(envVarName) : undefined;
         if (envValue !== undefined) {
             const parsed = Number(envValue);
-            if (Number.isFinite(parsed) && parsed >= 0) {
+            if (isValid(parsed)) {
                 return parsed;
             }
+            console.warn(`[GeminiEmbedding] ⚠️  Invalid ${envVarName} (${envValue}); using default ${defaultValue}`);
+            return defaultValue;
         }
 
         return defaultValue;
     }
 
     private async withRetry<T>(operation: () => Promise<T>): Promise<T> {
-        const maxAttempts = this.maxRetries + 1;
+        // this.maxRetries is validated at construction, but this guard keeps
+        // the loop from misbehaving (0 or negative attempts, or a fractional
+        // attempt count) if that ever changes.
+        const maxAttempts = Math.max(1, Math.floor(this.maxRetries) + 1);
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
@@ -195,7 +239,7 @@ export class GeminiEmbedding extends Embedding {
                 }
 
                 const delayMs = this.computeRetryDelayMs(attempt);
-                console.warn(`[Gemini] ⚠️  Embedding request failed (${this.describeError(error)}), retrying in ${Math.round(delayMs)}ms (retry ${attempt}/${this.maxRetries})`);
+                console.warn(`[GeminiEmbedding] ⚠️  Embedding request failed (${this.describeError(error)}), retrying in ${Math.round(delayMs)}ms (retry ${attempt}/${this.maxRetries})`);
                 await this.sleep(delayMs);
             }
         }
@@ -204,7 +248,12 @@ export class GeminiEmbedding extends Embedding {
     }
 
     private isRetryableError(error: unknown): boolean {
-        if (error instanceof TypeError && error.message === 'fetch failed') {
+        // @google/genai's Node transport catches a fetch rejection and
+        // rethrows it as a plain Error, e.g. "exception TypeError: fetch
+        // failed sending request", dropping the original TypeError and its
+        // cause (so the code/cause.code branch below can't see it). Match on
+        // the message instead of the error's type or a cause code.
+        if (error instanceof Error && /fetch failed/i.test(error.message)) {
             return true;
         }
 
@@ -212,52 +261,56 @@ export class GeminiEmbedding extends Embedding {
             return false;
         }
 
-        const err = error as {
-            status?: unknown;
-            response?: { status?: unknown };
-            code?: unknown;
-            cause?: { code?: unknown };
-            message?: unknown;
-        };
-
-        const status = typeof err.status === 'number'
-            ? err.status
-            : (err.response && typeof err.response.status === 'number' ? err.response.status : undefined);
+        const { status, code } = this.extractStatusAndCode(error);
 
         if (status !== undefined) {
             return RETRYABLE_HTTP_STATUSES.has(status);
         }
 
-        const message = typeof err.message === 'string' ? err.message : '';
+        const message = typeof (error as { message?: unknown }).message === 'string' ? (error as { message: string }).message : '';
         if (RETRYABLE_QUOTED_STATUS_PATTERN.test(message)) {
             return true;
         }
 
+        // Still reachable from google-auth-library/gaxios token-refresh
+        // errors, which do carry a code (e.g. ECONNRESET) rather than the
+        // generic "fetch failed" message above.
+        return code !== undefined && RETRYABLE_NETWORK_CODES.has(code);
+    }
+
+    /**
+     * Best-effort HTTP status and error code extraction, shared by
+     * isRetryableError and describeError: a direct property for SDK errors,
+     * or a nested one (response.status, cause.code) for gaxios/
+     * google-auth-library errors.
+     */
+    private extractStatusAndCode(error: unknown): { status?: number; code?: string } {
+        if (!error || typeof error !== 'object') {
+            return {};
+        }
+
+        const err = error as {
+            status?: unknown;
+            response?: { status?: unknown };
+            code?: unknown;
+            cause?: { code?: unknown };
+        };
+
+        const status = typeof err.status === 'number'
+            ? err.status
+            : (err.response && typeof err.response.status === 'number' ? err.response.status : undefined);
         const code = typeof err.code === 'string'
             ? err.code
             : (err.cause && typeof err.cause.code === 'string' ? err.cause.code : undefined);
 
-        return code !== undefined && RETRYABLE_NETWORK_CODES.has(code);
+        return { status, code };
     }
 
     private describeError(error: unknown): string {
         if (error && typeof error === 'object') {
-            const err = error as {
-                status?: unknown;
-                response?: { status?: unknown };
-                code?: unknown;
-                cause?: { code?: unknown };
-                message?: unknown;
-            };
-
-            const status = typeof err.status === 'number'
-                ? err.status
-                : (err.response && typeof err.response.status === 'number' ? err.response.status : undefined);
-            const code = typeof err.code === 'string'
-                ? err.code
-                : (err.cause && typeof err.cause.code === 'string' ? err.cause.code : undefined);
+            const { status, code } = this.extractStatusAndCode(error);
             const identifier = status !== undefined ? status : code;
-            const message = typeof err.message === 'string' ? err.message : String(error);
+            const message = typeof (error as { message?: unknown }).message === 'string' ? (error as { message: string }).message : String(error);
 
             return identifier !== undefined ? `${identifier}: ${message}` : message;
         }
@@ -279,7 +332,7 @@ export class GeminiEmbedding extends Embedding {
         const attempts = error && typeof error === 'object' ? (error as Record<string, unknown>).attempts : undefined;
 
         return typeof attempts === 'number'
-            ? `${prefix} after ${attempts} attempts: ${message}`
+            ? `${prefix} after ${attempts} ${attempts === 1 ? 'attempt' : 'attempts'}: ${message}`
             : `${prefix}: ${message}`;
     }
 
